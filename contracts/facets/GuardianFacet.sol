@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "../libraries/LibDiamond.sol";
+
 contract GuardianFacet {
     bytes32 constant GUARDIAN_STORAGE_POSITION = keccak256("cppay.guardian.storage");
 
@@ -39,13 +41,7 @@ contract GuardianFacet {
     event RecoveryCancelled(address indexed newOwner);
 
     modifier onlyOwner() {
-        bytes32 position = keccak256("cppay.account.storage");
-        address owner_;
-        assembly {
-            mstore(0, position)
-            owner_ := sload(keccak256(0, 32))
-        }
-        require(msg.sender == owner_, "Guardian: not owner");
+        require(msg.sender == LibDiamond.contractOwner(), "Guardian: not owner");
         _;
     }
 
@@ -88,10 +84,7 @@ contract GuardianFacet {
 
     function setThreshold(uint256 newThreshold) external onlyOwner {
         GuardianStorage storage gs = guardianStorage();
-        require(
-            newThreshold >= MIN_THRESHOLD && newThreshold <= gs.guardians.length,
-            "Guardian: invalid threshold"
-        );
+        require(newThreshold >= MIN_THRESHOLD && newThreshold <= gs.guardians.length, "Guardian: invalid threshold");
         gs.threshold = newThreshold;
         emit ThresholdChanged(newThreshold);
     }
@@ -99,37 +92,44 @@ contract GuardianFacet {
     function initiateRecovery(address newOwner) external onlyGuardian {
         GuardianStorage storage gs = guardianStorage();
         RecoveryRequest storage request = gs.recoveryRequests[newOwner];
-        
+
         require(newOwner != address(0), "Guardian: zero address");
+        require(request.votesReceived == 0, "Guardian: recovery already initiated");
+
+        request.newOwner = newOwner;
+        request.executeAfter = block.timestamp + RECOVERY_DELAY;
+        request.hasVoted[msg.sender] = true;
+        request.votesReceived = 1;
+
+        emit RecoveryInitiated(newOwner, request.executeAfter);
+        emit RecoveryVoted(msg.sender, newOwner);
+    }
+
+    function voteRecovery(address newOwner) external onlyGuardian {
+        GuardianStorage storage gs = guardianStorage();
+        RecoveryRequest storage request = gs.recoveryRequests[newOwner];
+
+        require(newOwner != address(0), "Guardian: zero address");
+        require(request.newOwner == newOwner, "Guardian: recovery not initiated");
         require(!request.hasVoted[msg.sender], "Guardian: already voted");
         require(!request.executed, "Guardian: already executed");
 
-        if (request.votesReceived == 0) {
-            request.newOwner = newOwner;
-            request.executeAfter = block.timestamp + RECOVERY_DELAY;
-            emit RecoveryInitiated(newOwner, request.executeAfter);
-        }
-
         request.hasVoted[msg.sender] = true;
         request.votesReceived++;
+
         emit RecoveryVoted(msg.sender, newOwner);
     }
 
     function executeRecovery(address newOwner) external {
         GuardianStorage storage gs = guardianStorage();
         RecoveryRequest storage request = gs.recoveryRequests[newOwner];
-        
+
         require(request.votesReceived >= gs.threshold, "Guardian: threshold not reached");
         require(block.timestamp >= request.executeAfter, "Guardian: delay not passed");
         require(!request.executed, "Guardian: already executed");
 
-        bytes32 position = keccak256("cppay.account.storage");
-        address oldOwner;
-        assembly {
-            mstore(0, position)
-            oldOwner := sload(keccak256(0, 32))
-            sstore(keccak256(0, 32), newOwner)
-        }
+        address oldOwner = LibDiamond.contractOwner();
+        LibDiamond.setContractOwner(newOwner);
 
         request.executed = true;
         emit RecoveryExecuted(oldOwner, newOwner);
@@ -138,7 +138,7 @@ contract GuardianFacet {
     function cancelRecovery(address newOwner) external onlyOwner {
         GuardianStorage storage gs = guardianStorage();
         RecoveryRequest storage request = gs.recoveryRequests[newOwner];
-        
+
         require(request.votesReceived > 0, "Guardian: no active recovery");
         require(!request.executed, "Guardian: already executed");
 
@@ -154,10 +154,10 @@ contract GuardianFacet {
         return guardianStorage().threshold;
     }
 
-    function getRecoveryRequest(address newOwner) 
-        external 
-        view 
-        returns (uint256 votesReceived, uint256 executeAfter, bool executed) 
+    function getRecoveryRequest(address newOwner)
+        external
+        view
+        returns (uint256 votesReceived, uint256 executeAfter, bool executed)
     {
         RecoveryRequest storage request = guardianStorage().recoveryRequests[newOwner];
         return (request.votesReceived, request.executeAfter, request.executed);
