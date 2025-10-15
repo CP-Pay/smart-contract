@@ -1,99 +1,102 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "../libraries/LibAppStorage.sol";
+import "../libraries/LibDiamond.sol";
+
 contract SessionKeyFacet {
-    bytes32 constant SESSION_STORAGE_POSITION = keccak256("cppay.session.storage");
+    error InvalidDuration();
+    error InvalidAmount();
+    error NoFunctions();
+    error AlreadyExists();
+    error NotFound();
+    error SessionRevoked();
+    error SessionExpired();
+    error LimitExceeded();
+    error FunctionNotAllowed();
+    error UnauthorizedKey();
 
-    struct Session {
-        address creator;
-        uint256 validUntil;
-        uint256 maxAmount;
-        uint256 spentAmount;
-        bytes4[] allowedFunctions;
-        bool revoked;
-    }
+    function createSessionKey(address key, uint256 duration, uint256 maxAmount, bytes4[] calldata allowedFunctions)
+        external
+        returns (bytes32 keyId)
+    {
+        if (key == address(0)) revert NotFound();
+        if (duration == 0 || duration > 7 days) revert InvalidDuration();
+        if (maxAmount == 0) revert InvalidAmount();
+        if (allowedFunctions.length == 0) revert NoFunctions();
 
-    struct SessionKeyStorage {
-        mapping(address => Session) sessions;
-        mapping(address => address[]) userSessions;
-    }
+        LibAppStorage.AppStorage storage s = LibAppStorage.appStorage();
+        keyId = keccak256(abi.encodePacked(msg.sender, key, block.timestamp));
 
-    function sessionStorage() internal pure returns (SessionKeyStorage storage ss) {
-        bytes32 position = SESSION_STORAGE_POSITION;
-        assembly {
-            ss.slot := position
+        if (s.sessionKeys[keyId].key != address(0)) {
+            revert AlreadyExists();
         }
+
+        uint256 expiry = block.timestamp + duration;
+
+        s.sessionKeys[keyId] = LibAppStorage.SessionKey({
+            key: key,
+            expiry: expiry,
+            selectors: allowedFunctions,
+            perTxGasCap: maxAmount,
+            spentAmount: 0,
+            revoked: false
+        });
+
+        s.userSessionKeys[msg.sender].push(keyId);
+        emit LibAppStorage.SessionKeyCreated(msg.sender, keyId, expiry);
     }
 
-    event SessionCreated(address indexed sessionKey, address indexed creator, uint256 validUntil, uint256 maxAmount);
-    event SessionExecuted(address indexed sessionKey, bytes4 indexed functionSelector, uint256 amount);
-    event SessionRevoked(address indexed sessionKey);
+    function revokeSessionKey(bytes32 keyId) external {
+        LibAppStorage.AppStorage storage s = LibAppStorage.appStorage();
+        LibAppStorage.SessionKey storage sessionKey = s.sessionKeys[keyId];
 
-    modifier onlyOwner() {
-        bytes32 position = keccak256("cppay.account.storage");
-        address owner_;
-        assembly {
-            mstore(0, position)
-            owner_ := sload(keccak256(0, 32))
+        if (sessionKey.key == address(0)) revert NotFound();
+        sessionKey.revoked = true;
+        emit LibAppStorage.SessionKeyRevoked(msg.sender, keyId);
+    }
+
+    function isValidSessionKey(bytes32 keyId, bytes4 selector, uint256 gasLimit) external view returns (bool isValid) {
+        LibAppStorage.AppStorage storage s = LibAppStorage.appStorage();
+        LibAppStorage.SessionKey storage sessionKey = s.sessionKeys[keyId];
+
+        if (sessionKey.key == address(0)) return false;
+        if (sessionKey.revoked) return false;
+        if (block.timestamp > sessionKey.expiry) return false;
+        if (gasLimit > sessionKey.perTxGasCap) return false;
+
+        bool selectorAllowed = false;
+        for (uint256 i = 0; i < sessionKey.selectors.length; i++) {
+            if (sessionKey.selectors[i] == selector) {
+                selectorAllowed = true;
+                break;
+            }
         }
-        require(msg.sender == owner_, "Session: not owner");
-        _;
+
+        return selectorAllowed;
     }
 
-    function createSession(
-        address sessionKey,
-        uint256 duration,
-        uint256 maxAmount,
-        bytes4[] calldata allowedFunctions
-    ) external onlyOwner {
-        SessionKeyStorage storage ss = sessionStorage();
-        
-        require(sessionKey != address(0), "Session: zero address");
-        require(duration > 0 && duration <= 7 days, "Session: invalid duration");
-        require(maxAmount > 0, "Session: invalid amount");
-        require(allowedFunctions.length > 0, "Session: no functions");
+    function executeWithSession(bytes32 keyId, address dest, uint256 value, bytes calldata data) external {
+        LibAppStorage.AppStorage storage s = LibAppStorage.appStorage();
+        LibAppStorage.SessionKey storage sessionKey = s.sessionKeys[keyId];
 
-        Session storage session = ss.sessions[sessionKey];
-        require(session.creator == address(0), "Session: already exists");
-
-        session.creator = msg.sender;
-        session.validUntil = block.timestamp + duration;
-        session.maxAmount = maxAmount;
-        session.spentAmount = 0;
-        session.allowedFunctions = allowedFunctions;
-        session.revoked = false;
-
-        ss.userSessions[msg.sender].push(sessionKey);
-
-        emit SessionCreated(sessionKey, msg.sender, session.validUntil, maxAmount);
-    }
-
-    function executeWithSession(
-        address sessionKey,
-        address dest,
-        uint256 value,
-        bytes calldata data
-    ) external {
-        SessionKeyStorage storage ss = sessionStorage();
-        Session storage session = ss.sessions[sessionKey];
-        
-        require(msg.sender == sessionKey, "Session: unauthorized key");
-        require(session.creator != address(0), "Session: not found");
-        require(!session.revoked, "Session: revoked");
-        require(block.timestamp <= session.validUntil, "Session: expired");
-        require(session.spentAmount + value <= session.maxAmount, "Session: limit exceeded");
+        if (sessionKey.key == address(0)) revert NotFound();
+        if (msg.sender != sessionKey.key) revert UnauthorizedKey();
+        if (sessionKey.revoked) revert SessionRevoked();
+        if (block.timestamp > sessionKey.expiry) revert SessionExpired();
+        if (sessionKey.spentAmount + value > sessionKey.perTxGasCap) revert LimitExceeded();
 
         bytes4 functionSelector = bytes4(data[:4]);
         bool functionAllowed = false;
-        for (uint256 i = 0; i < session.allowedFunctions.length; i++) {
-            if (session.allowedFunctions[i] == functionSelector) {
+        for (uint256 i = 0; i < sessionKey.selectors.length; i++) {
+            if (sessionKey.selectors[i] == functionSelector) {
                 functionAllowed = true;
                 break;
             }
         }
-        require(functionAllowed, "Session: function not allowed");
+        if (!functionAllowed) revert FunctionNotAllowed();
 
-        session.spentAmount += value;
+        sessionKey.spentAmount += value;
 
         (bool success, bytes memory result) = dest.call{value: value}(data);
         if (!success) {
@@ -101,55 +104,20 @@ contract SessionKeyFacet {
                 revert(add(result, 32), mload(result))
             }
         }
-
-        emit SessionExecuted(sessionKey, functionSelector, value);
     }
 
-    function revokeSession(address sessionKey) external onlyOwner {
-        SessionKeyStorage storage ss = sessionStorage();
-        Session storage session = ss.sessions[sessionKey];
-        
-        require(session.creator == msg.sender, "Session: not creator");
-        require(!session.revoked, "Session: already revoked");
-
-        session.revoked = true;
-        emit SessionRevoked(sessionKey);
-    }
-
-    function getSession(address sessionKey)
+    function getSessionKey(bytes32 keyId)
         external
         view
-        returns (
-            address creator,
-            uint256 validUntil,
-            uint256 maxAmount,
-            uint256 spentAmount,
-            bool revoked,
-            bytes4[] memory allowedFunctions
-        )
+        returns (address key, uint256 expiry, uint256 perTxGasCap, uint256 spentAmount, bool revoked)
     {
-        Session storage session = sessionStorage().sessions[sessionKey];
-        return (
-            session.creator,
-            session.validUntil,
-            session.maxAmount,
-            session.spentAmount,
-            session.revoked,
-            session.allowedFunctions
-        );
+        LibAppStorage.AppStorage storage s = LibAppStorage.appStorage();
+        LibAppStorage.SessionKey storage sessionKey = s.sessionKeys[keyId];
+        return (sessionKey.key, sessionKey.expiry, sessionKey.perTxGasCap, sessionKey.spentAmount, sessionKey.revoked);
     }
 
-    function getUserSessions(address user) external view returns (address[] memory) {
-        return sessionStorage().userSessions[user];
-    }
-
-    function isSessionValid(address sessionKey) external view returns (bool) {
-        Session storage session = sessionStorage().sessions[sessionKey];
-        return (
-            session.creator != address(0) &&
-            !session.revoked &&
-            block.timestamp <= session.validUntil &&
-            session.spentAmount < session.maxAmount
-        );
+    function getUserSessionKeys(address user) external view returns (bytes32[] memory keyIds) {
+        LibAppStorage.AppStorage storage s = LibAppStorage.appStorage();
+        return s.userSessionKeys[user];
     }
 }

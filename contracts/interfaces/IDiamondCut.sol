@@ -2,7 +2,11 @@
 pragma solidity ^0.8.20;
 
 interface IDiamondCut {
-    enum FacetCutAction {Add, Replace, Remove}
+    enum FacetCutAction {
+        Add,
+        Replace,
+        Remove
+    }
 
     struct FacetCut {
         address facetAddress;
@@ -10,11 +14,7 @@ interface IDiamondCut {
         bytes4[] functionSelectors;
     }
 
-    function diamondCut(
-        FacetCut[] calldata _diamondCut,
-        address _init,
-        bytes calldata _calldata
-    ) external;
+    function diamondCut(FacetCut[] calldata _diamondCut, address _init, bytes calldata _calldata) external;
 
     event DiamondCut(FacetCut[] _diamondCut, address _init, bytes _calldata);
 }
