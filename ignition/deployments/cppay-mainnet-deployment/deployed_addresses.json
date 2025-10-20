@@ -1,0 +1,6 @@
+{
+  "DeployAllModule#BillPaymentAdapter": "0x141Ae7C8C9d53701df68C98c8566dAf4f59A83E6",
+  "DeployAllModule#CPPayPaymaster": "0x23A3eaf61dD01a2727Cb53B55F5B2635fba06A90",
+  "DeployAllModule#SessionKeyModule": "0x660C73D94b851E3A01CeF6d530D3226511aE1a3c",
+  "DeployAllModule#SwapRouter": "0x1E08536165d2862d7f7C5d83117C07DD40089d50"
+}
